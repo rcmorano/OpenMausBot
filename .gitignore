@@ -39,4 +39,6 @@ deploy/.env
 deploy/podman/.env
 deploy/podman/.env.*
 !deploy/podman/.env.example
+# bind-mounted compose data for compose.data.yml (see setup-data.sh)
+/data/
 /.env
