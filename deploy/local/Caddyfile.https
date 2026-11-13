@@ -1,0 +1,30 @@
+# The HTTPS edge for compose.data.yml: a self-signed certificate on its own port,
+# so the browser gets a secure context (secure cookies, crypto.randomUUID) and the
+# server sees the real Host plus the https scheme.
+#
+# Caddy otherwise automates certificates for named hosts; `auto_https off` keeps it
+# on the loaded self-signed pair even for a name the certificate does not cover, so
+# a LAN address just fails the browser's trust check instead of Caddy chasing ACME.
+{
+	auto_https off
+}
+
+:{$OMB_HTTPS_PORT:8443} {
+	tls /etc/caddy/certs/omb.crt /etc/caddy/certs/omb.key
+
+	encode zstd gzip
+
+	handle /hooks/* {
+		reverse_proxy 127.0.0.1:8800 {
+			header_up X-Forwarded-Proto https
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8799 {
+			header_up X-Forwarded-Proto https
+			flush_interval -1
+		}
+	}
+}
