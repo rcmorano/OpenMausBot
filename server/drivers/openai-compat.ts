@@ -152,6 +152,14 @@ function decodeConfig(raw: unknown): OpenAICompatConfig {
   };
 }
 
+/** A gateway that names every alias after its base model — llama-swap's /models rows carry
+ * the same `name` for all six variants of one model — so the label keeps the part of the id
+ * the name misses; a name that is not the id's prefix stays as it is. */
+function rowLabel(id: string, name: string): string {
+  const variant = name && id.startsWith(name) ? id.slice(name.length).replace(/^[:/]/, "") : "";
+  return variant ? `${name} · ${variant}` : name;
+}
+
 export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
   driverKind: DRIVER_KIND,
   metadata: {
@@ -253,7 +261,8 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           const id = gemini ? geminiChatModelId(rawId) ?? "" : rawId;
           if (!id || seen.has(id) || isContextName(id)) continue;
           seen.add(id);
-          const label = typeof row.name === "string" && row.name.trim() ? row.name : id;
+          const name = typeof row.name === "string" ? row.name.trim() : "";
+          const label = name ? rowLabel(id, name) : id;
           const contextWindow = advertisedContextWindow(row);
           options.push({
             id,
