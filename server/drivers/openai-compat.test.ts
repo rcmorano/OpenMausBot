@@ -299,6 +299,40 @@ describe("OpenAICompatDriver", () => {
     await inst.dispose();
   });
 
+  it("labels a gateway's variants apart when every alias shares the model's name", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              { id: "qwen38-flash", name: "qwen38-flash" },
+              { id: "qwen38-flash:low-reasoning", name: "qwen38-flash" },
+              { id: "qwen38-flash:instruct-nothink", name: "qwen38-flash" },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "test-aliases",
+      displayName: "Aliases",
+      enabled: true,
+      config: { url: "http://127.0.0.1:40002/v1", apiKeyEnv: "TEST_KEY" },
+      environment: { TEST_KEY: "secret" },
+    });
+
+    await inst.refreshModels?.();
+
+    expect(inst.models.options.map((model) => model.label)).toEqual([
+      "qwen38-flash",
+      "qwen38-flash · low-reasoning",
+      "qwen38-flash · instruct-nothink",
+    ]);
+    await inst.dispose();
+  });
+
   it("lists LM Studio chat keys from the native catalog and skips the OpenAI variant id", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
