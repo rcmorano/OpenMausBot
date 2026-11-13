@@ -1,0 +1,117 @@
+# OpenMausBot with every persistent path as a bind mount under ./data — no named
+# docker volumes. Run it from this folder:
+#
+#   OMB_HTTPS_NAMES="localhost 127.0.0.1 <lan name>" ./setup-data.sh   # ./data/*, the cert, the seeds
+#   docker compose -f compose.data.yml up -d   # then https://localhost:8443
+#
+# A change to the app's own source reaches the container only through the repo's
+# Dockerfile (`docker build -t openmausbot-local .`): `deploy/local` layers engines on
+# top of the published image, so `up -d --build` here rebuilds without the change.
+#
+# Models: the same llama-swap gateway ~/.omp/agent/models.yml describes. This
+# stack consumes that gateway rather than running a second copy — the GPU hosts
+# and the ssh macros that bring a model up belong to it, so a duplicate service
+# here would fight the instance that is already serving them. The model ids the
+# app lists for the instance are the ones llama-swap advertises on /v1/models,
+# which are models.yml's ids. The gateway is reached on loopback: the driver's image and
+# computer-tool gate (server/drivers/chat-images.ts:22-27) accepts plain http only for this
+# machine, so a bridge-network address such as host.docker.internal or a service name is
+# refused — run llama-swap on the same host, as the dr34mb0x stack does.
+#
+# The omp agent runs as an engine inside this container: ./data/omp is its config
+# root ($HOME/.omp), seeded by setup-data.sh from ~/.omp/agent, and the CLI is
+# mounted read-only so the customAcp instance can spawn `/opt/omp/omp acp`. Its
+# own state (sessions, memories, agent.db) stays inside ./data/omp, so it never
+# shares a live SQLite file with the agent on the host.
+name: ${COMPOSE_PROJECT_NAME:-openmausbot-data}
+
+services:
+  omb:
+    # Collects exited browser processes; Chrome's shared memory as on the
+    # desktop containers (docs/browser-packaging.md, "Process hygiene").
+    init: true
+    shm_size: 512m
+    build:
+      context: ./deploy/local
+      args:
+        BASE_IMAGE: ${OMB_BASE_IMAGE:-ghcr.io/milind-soni/openmausbot:latest}
+        ENGINES: ${ENGINES:-@anthropic-ai/claude-code @openai/codex}
+    image: ${OMB_LOCAL_IMAGE:-openmausbot-local:latest}
+    restart: unless-stopped
+    # Bind mounts keep the host's ownership, so run as the host user; the image's
+    # own user is 1001. Whoever owns ./data is who OMB must run as, otherwise the
+    # data tree needs a one-time recursive chown.
+    user: "${OMB_UID:-1000}:${OMB_GID:-1000}"
+    # The socket is root:docker 0660, so the container user needs that group on it.
+    group_add:
+      - "${DOCKER_GID:-956}"
+    # Bot boxes (docs/bot-box.md) need unprivileged user namespaces: Docker's
+    # default seccomp profile denies unshare, so a boxed server reports "off"
+    # without this. The box also needs `bwrap`, which only the cloud-home stage
+    # installs, so a from-source build has to add it for boxes to come on.
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      # The data root mounts at its own host path (deploy/podman/README.md): a Local VM
+      # workspace is handed to the daemon as a bind source, so the server and the daemon
+      # have to agree on the absolute path. setup-data.sh writes it to .env.
+      - ${OMB_DATA_ROOT:?Run ./setup-data.sh first}:${OMB_DATA_ROOT}
+      - ./data/omp:${OMB_DATA_ROOT}/.omp
+      - ${OMP_BIN:-/home/linuxbrew/.linuxbrew/bin/omp}:/opt/omp/omp:ro
+      # Docker for the bot desktops, bound the way orca-docker binds it: the daemon socket
+      # plus the host CLI, since the image ships neither.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DOCKER_BIN:-/usr/bin/docker}:/usr/local/bin/docker:ro
+    # Compose `ports:` is ignored with host networking: Caddy binds the port on the host,
+    # and the server still listens on loopback only (docs/self-hosting.md, "Docker"). The
+    # bot desktops are siblings on the host daemon, bound below.
+    network_mode: "host"
+    environment:
+      HOME: ${OMB_DATA_ROOT:?Run ./setup-data.sh first}
+      OMB_DATA_DIR: ${OMB_DATA_ROOT}/.openmausbot
+      OMB_PORT: "8799"
+      OMB_WEBHOOK_PORT: "8800"
+      # Pairing links and hook URLs print with this origin; set it to the address you
+      # actually open (https://localhost:8443 or https://<lan name or ip>:8443).
+      OMB_PUBLIC_URL: ${OMB_PUBLIC_URL:-https://localhost:${OMB_HTTPS_PORT:-8443}}
+      OMB_WEBHOOK_PUBLIC_URL: ${OMB_WEBHOOK_PUBLIC_URL:-${OMB_PUBLIC_URL:-https://localhost:${OMB_HTTPS_PORT:-8443}}}
+      # The gateway models.yml points at, on this machine's loopback. An openai-compat
+      # instance with no url of its own takes these four, so the seeded config.json stays
+      # gateway-agnostic and the model list comes from the gateway's own /models.
+      OPENAI_COMPAT_URL: ${LLAMA_SWAP_URL:-http://127.0.0.1:${LLAMA_SWAP_PORT:-40002}/v1}
+      OPENAI_COMPAT_MODEL: ${LLAMA_SWAP_MODEL:-qwen38-flash-strata-iq2:low-reasoning}
+      # llama-swap serves without a key; the driver needs a non-empty value.
+      OPENAI_COMPAT_API_KEY: ${OPENAI_COMPAT_API_KEY:-llama-swap}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8799/api/health', { signal: AbortSignal.timeout(4000) }).then(async r => { if (!r.ok || !(await r.text()).includes('openmausbot')) process.exit(1); }).catch(() => process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2}
+    restart: unless-stopped
+    # Caddy runs in the server's network namespace, so it reaches the server on
+    # 127.0.0.1 and the server never binds anything public (docs/self-hosting.md,
+    # "Docker"). Ports are declared on the namespace owner, `omb`.
+    network_mode: service:omb
+    # TLS on its own port with the self-signed pair from ./data/caddy/certs. The server
+    # treats any request that carries forwarding headers as remote (server/request-auth.ts
+    # isProxied), so a browser here needs a paired session rather than loopback owner
+    # trust: Host preserved, X-Forwarded-Proto https, X-Forwarded-For by Caddy, and the
+    # event stream unbuffered. The cert covers the names setup-data.sh was given.
+    environment:
+      OMB_HTTPS_PORT: "${OMB_HTTPS_PORT:-8443}"
+    depends_on:
+      omb:
+        condition: service_healthy
+    volumes:
+      - ./deploy/local/Caddyfile.https:/etc/caddy/Caddyfile:ro
+      - ./data/caddy/certs:/etc/caddy/certs:ro
+      - ./data/caddy/data:/data
+      - ./data/caddy/config:/config
